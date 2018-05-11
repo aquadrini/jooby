@@ -205,15 +205,15 @@ package org.jooby.internal;
 
 import com.google.common.base.Strings;
 import com.google.common.base.Throwables;
-import com.google.common.cache.CacheBuilder;
-import com.google.common.cache.CacheLoader;
-import com.google.common.cache.LoadingCache;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Sets;
 import com.google.inject.Injector;
 import com.google.inject.Key;
 import com.google.inject.name.Names;
 import com.typesafe.config.Config;
 import static java.util.Objects.requireNonNull;
+
+import io.norberg.rut.Router;
 import org.jooby.Deferred;
 import org.jooby.Err;
 import org.jooby.Err.Handler;
@@ -253,12 +253,16 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.Executor;
 import java.util.function.Function;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 @Singleton
 public class HttpHandlerImpl implements HttpHandler {
 
-  private static class RouteKey {
+    private static final Pattern COLON_PATTERN =Pattern.compile("/:([^/]+)");
+    private static final Pattern BRACKET_PATTERN =Pattern.compile("/\\{([^/]+)\\}");
+
+    private static class RouteKey {
 
     private final String method;
 
@@ -351,8 +355,6 @@ public class HttpHandlerImpl implements HttpHandler {
 
   private List<Locale> locales;
 
-  private final LoadingCache<RouteKey, Route[]> routeCache;
-
   private final String redirectHttps;
 
   private Function<String, String> rpath = null;
@@ -364,6 +366,8 @@ public class HttpHandlerImpl implements HttpHandler {
   private final Map<String, Renderer> rendererMap;
 
   private StatusCodeProvider sc;
+
+  private final Router<Route.Definition> router;
 
   /**
    * Global deferred executor.
@@ -398,9 +402,8 @@ public class HttpHandlerImpl implements HttpHandler {
     this.renderers = new ArrayList<>(renderers);
     rendererMap = new HashMap<>();
     this.renderers.forEach(r -> rendererMap.put(r.name(), r));
+    this.router = router(routes);
 
-    // route cache
-    routeCache = routeCache(routes, config);
     // force https
     String redirectHttps = config.getString("application.redirect_https").trim();
     this.redirectHttps = redirectHttps.length() > 0 ? redirectHttps : null;
@@ -488,8 +491,13 @@ public class HttpHandlerImpl implements HttpHandler {
       }
 
       // usual req/rsp
-      Route[] routes = routeCache
-          .getUnchecked(new RouteKey(method, path, type, req.accept()));
+      RouteKey key = new RouteKey(method, path, type, req.accept());
+      // = routes(this.routes, key.method, key.path, key.consumes, key.produces);
+      final Router.Result<Route.Definition> result = router.result();
+      router.route(method, path, result);
+
+      Route[] routes = result.isSuccess() ? routes(result, key.method, key.path, key.consumes, key.produces)
+              : new Route[0];
 
       RouteChain chain = new RouteChain(req, rsp, routes);
       scope.put(CHAIN, chain);
@@ -606,47 +614,59 @@ public class HttpHandlerImpl implements HttpHandler {
     return len > 1 && uri.charAt(len - 1) == '/' ? uri.substring(0, len - 1) : uri;
   }
 
-  private static Route[] routes(final Set<Route.Definition> routeDefs, final String method,
-      final String path, final MediaType type, final List<MediaType> accept) {
-    List<Route> routes = findRoutes(routeDefs, method, path, type, accept);
+    private static Route[] routes(final Router.Result<Route.Definition> result, final String method,
+                                  final String path, final MediaType type,
+                                  final List<MediaType> accept) {
 
-    routes.add(RouteImpl.fallback((req, rsp, chain) -> {
-      if (!rsp.status().isPresent()) {
-        // 406 or 415
-        Err ex = handle406or415(routeDefs, method, path, type, accept);
-        if (ex != null) {
-          throw ex;
+        Route.Definition definition = result.target();
+
+        int paramsSize = result.params();
+        Map<Object,String> params = new HashMap<>(paramsSize);
+
+        for (int i = 0; i < paramsSize; i++) {
+            params.put(result.paramName(i), result.paramValue(i).toString());
         }
-        // 405
-        ex = handle405(routeDefs, method, path, type, accept);
-        if (ex != null) {
-          throw ex;
-        }
-        // favicon.ico
-        if (path.equals("/favicon.ico")) {
-          // default /favicon.ico handler:
-          rsp.status(Status.NOT_FOUND).end();
-        } else {
-          throw new Err(Status.NOT_FOUND, req.path(true));
-        }
-      }
-    }, method, path, "err", accept));
 
-    return routes.toArray(new Route[routes.size()]);
-  }
+        Set<Route.Definition> routeDefs = ImmutableSet.of(definition);
 
-  private static List<Route> findRoutes(final Set<Route.Definition> routeDefs, final String method,
-      final String path, final MediaType type, final List<MediaType> accept) {
+        List<Route> routes = findRoutes(routeDefs, method, path, params, type, accept);
 
-    List<Route> routes = new ArrayList<>();
-    for (Route.Definition routeDef : routeDefs) {
-      Optional<Route> route = routeDef.matches(method, path, type, accept);
-      if (route.isPresent()) {
-        routes.add(route.get());
-      }
+        routes.add(RouteImpl.fallback((req, rsp, chain) -> {
+            if (!rsp.status().isPresent()) {
+                // 406 or 415
+                Err ex = handle406or415(result, method, path, params, type, accept);
+                if (ex != null) {
+                    throw ex;
+                }
+                // 405
+                ex = handle405(routeDefs, method, path, params, type, accept);
+                if (ex != null) {
+                    throw ex;
+                }
+                // favicon.ico
+                if (path.equals("/favicon.ico")) {
+                    // default /favicon.ico handler:
+                    rsp.status(Status.NOT_FOUND).end();
+                } else {
+                    throw new Err(Status.NOT_FOUND, req.path(true));
+                }
+            }
+        }, method, path, "err", accept));
+
+        return routes.toArray(new Route[routes.size()]);
     }
-    return routes;
-  }
+
+    private static List<Route> findRoutes(final Set<Route.Definition> routeDefs, final String method,
+                                          final String path, final Map<Object, String> vars,
+                                          final MediaType type, final List<MediaType> accept) {
+
+        List<Route> routes = new LinkedList<>();
+        for (Route.Definition routeDef : routeDefs) {
+            Optional<Route> route = routeDef.simplyMatches(method, path, vars, type, accept);
+            route.ifPresent(routes::add);
+        }
+        return routes;
+    }
 
   private static Optional<WebSocket> findSockets(final Set<WebSocket.Definition> sockets,
       final String path) {
@@ -660,22 +680,22 @@ public class HttpHandlerImpl implements HttpHandler {
   }
 
   private static Err handle405(final Set<Route.Definition> routeDefs, final String method,
-      final String path, final MediaType type, final List<MediaType> accept) {
+      final String path, final Map<Object,String> vars, final MediaType type, final List<MediaType> accept) {
 
-    if (alternative(routeDefs, method, path).size() > 0) {
+    if (alternative(routeDefs, vars, method, path).size() > 0) {
       return new Err(Status.METHOD_NOT_ALLOWED, method);
     }
 
     return null;
   }
 
-  private static List<Route> alternative(final Set<Route.Definition> routeDefs, final String verb,
-      final String uri) {
+  private static List<Route> alternative(final Set<Route.Definition> routeDefs, final Map<Object,String> vars,
+                                         final String verb, final String uri) {
     List<Route> routes = new LinkedList<>();
     Set<String> verbs = Sets.newHashSet(Route.METHODS);
     verbs.remove(verb);
     for (String alt : verbs) {
-      findRoutes(routeDefs, alt, uri, MediaType.all, MediaType.ALL)
+      findRoutes(routeDefs, alt, uri, vars, MediaType.all, MediaType.ALL)
           .stream()
           // skip glob pattern
           .filter(r -> !r.pattern().contains("*"))
@@ -685,10 +705,13 @@ public class HttpHandlerImpl implements HttpHandler {
     return routes;
   }
 
-  private static Err handle406or415(final Set<Route.Definition> routeDefs, final String method,
-      final String path, final MediaType contentType, final List<MediaType> accept) {
-    for (Route.Definition routeDef : routeDefs) {
-      Optional<Route> route = routeDef.matches(method, path, MediaType.all, MediaType.ALL);
+  private static Err handle406or415(final Router.Result<Route.Definition> result, final String method,
+                                    final String path, final Map<Object,String> vars, final MediaType contentType,
+                                    final List<MediaType> accept) {
+
+      Route.Definition routeDef = result.target();
+
+      Optional<Route> route = routeDef.simplyMatches(method, path, vars, MediaType.all, MediaType.ALL);
       if (route.isPresent() && !route.get().pattern().contains("*")) {
         if (!routeDef.canProduce(accept)) {
           return new Err(Status.NOT_ACCEPTABLE, accept.stream()
@@ -699,7 +722,6 @@ public class HttpHandlerImpl implements HttpHandler {
           return new Err(Status.UNSUPPORTED_MEDIA_TYPE, contentType.name());
         }
       }
-    }
     return null;
   }
 
@@ -713,17 +735,6 @@ public class HttpHandlerImpl implements HttpHandler {
     return param.size() == 0 ? request.method() : param.get(0);
   }
 
-  private static LoadingCache<RouteKey, Route[]> routeCache(final Set<Route.Definition> routes,
-      final Config conf) {
-    return CacheBuilder.from(conf.getString("server.routes.Cache"))
-        .build(new CacheLoader<RouteKey, Route[]>() {
-          @Override
-          public Route[] load(final RouteKey key) throws Exception {
-            return routes(routes, key.method, key.path, key.consumes, key.produces);
-          }
-        });
-  }
-
   private static Function<String, String> rootpath(final String applicationPath) {
     return p -> {
       if (applicationPath.equals(p)) {
@@ -735,6 +746,19 @@ public class HttpHandlerImpl implements HttpHandler {
         return Route.errpath(p);
       }
     };
+  }
+
+  private static Router<Route.Definition> router(Set<Route.Definition> routes) {
+      Router.Builder<Route.Definition> builder = Router.builder(Route.Definition.class);
+
+      routes.forEach(def -> builder.route(def.method(), adaptWildcards(def.pattern()), def));
+
+      return builder.build();
+  }
+
+  private static String adaptWildcards(String urlPattern) {
+      String output = COLON_PATTERN.matcher(urlPattern).replaceAll("/<$1>");
+      return BRACKET_PATTERN.matcher(output).replaceAll("/<$1>");
   }
 
 }

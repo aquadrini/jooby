@@ -1633,6 +1633,34 @@ public interface Route {
     }
 
     /**
+     * Test if the route matches the given verb, path, content type and accept header.
+     *
+     * @param method A HTTP verb.
+     * @param path Current HTTP path.
+     * @param contentType The <code>Content-Type</code> header.
+     * @param accept The <code>Accept</code> header.
+     * @return A route or an empty optional.
+     */
+    @Nonnull
+    public Optional<Route> simplyMatches(final String method,
+                                   final String path,
+                                   final Map<Object,String> vars,
+                                   final MediaType contentType,
+                                   final List<MediaType> accept) {
+
+      List<MediaType> result = MediaType.matcher(accept).filter(this.produces);
+      if (result.size() > 0 && canConsume(contentType)) {
+        // keep accept when */*
+        List<MediaType> produces = result.size() == 1 && result.get(0).name().equals("*/*")
+                ? accept : this.produces;
+        return Optional
+                .of(asRoute(method, path, vars, produces, new RouteSourceImpl(declaringClass, line)));
+      }
+
+      return Optional.empty();
+    }
+
+    /**
      * @return HTTP method or <code>*</code>.
      */
     @Nonnull
@@ -1845,6 +1873,22 @@ public interface Route {
         final List<MediaType> produces, final Route.Source source) {
       return new RouteImpl(filter, this, method, matcher.path(), produces,
           matcher.vars(), mapper, source);
+    }
+
+    /**
+     * Creates a new route.
+     *
+     * @param method A HTTP verb.
+     * @param path A path string
+     * @param vars A map of matching variables
+     * @param produces List of produces types.
+     * @param source Route source.
+     * @return A new route.
+     */
+    private Route asRoute(final String method, final String path, Map<Object, String> vars,
+                          final List<MediaType> produces, final Route.Source source) {
+      return new RouteImpl(filter, this, method, path, produces,
+              vars, mapper, source);
     }
 
   }

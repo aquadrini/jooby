@@ -135,6 +135,13 @@
       <artifactId>guice-multibindings</artifactId>
     </dependency>
 
+    <!-- RUT Radix Tree routing -->
+    <dependency>
+      <groupId>io.norberg</groupId>
+      <artifactId>rut</artifactId>
+      <version>1.0</version>
+    </dependency>
+
     <!-- Test dependencies -->
     <dependency>
       <groupId>junit</groupId>
