@@ -213,6 +213,7 @@ import com.google.inject.name.Names;
 import com.typesafe.config.Config;
 import static java.util.Objects.requireNonNull;
 
+import com.typesafe.config.ConfigException;
 import io.norberg.rut.Router;
 import org.jooby.Deferred;
 import org.jooby.Err;
@@ -369,6 +370,8 @@ public class HttpHandlerImpl implements HttpHandler {
 
   private final Router<Route.Definition> router;
 
+  private final boolean matchMediaType;
+
   /**
    * Global deferred executor.
    */
@@ -403,6 +406,8 @@ public class HttpHandlerImpl implements HttpHandler {
     rendererMap = new HashMap<>();
     this.renderers.forEach(r -> rendererMap.put(r.name(), r));
     this.router = router(routes);
+
+    this.matchMediaType = config.getBoolean("server.routes.MatchMediaType");
 
     // force https
     String redirectHttps = config.getString("application.redirect_https").trim();
@@ -496,7 +501,9 @@ public class HttpHandlerImpl implements HttpHandler {
       final Router.Result<Route.Definition> result = router.result();
       router.route(method, path, result);
 
-      Route[] routes = result.isSuccess() ? routes(result, key.method, key.path, key.consumes, key.produces)
+      boolean matchMediaType = config.getBoolean("server.routing.MatchMediaType");
+
+      Route[] routes = result.isSuccess() ? routes(result, key.method, key.path, key.consumes, key.produces, matchMediaType)
               : new Route[0];
 
       RouteChain chain = new RouteChain(req, rsp, routes);
@@ -614,58 +621,59 @@ public class HttpHandlerImpl implements HttpHandler {
     return len > 1 && uri.charAt(len - 1) == '/' ? uri.substring(0, len - 1) : uri;
   }
 
-    private static Route[] routes(final Router.Result<Route.Definition> result, final String method,
+  private static Route[] routes(final Router.Result<Route.Definition> result, final String method,
                                   final String path, final MediaType type,
-                                  final List<MediaType> accept) {
+                                  final List<MediaType> accept, boolean matchMediaType) {
 
-        Route.Definition definition = result.target();
+      Route.Definition definition = result.target();
 
-        int paramsSize = result.params();
-        Map<Object,String> params = new HashMap<>(paramsSize);
+      int paramsSize = result.params();
+      Map<Object,String> params = new HashMap<>(paramsSize);
 
-        for (int i = 0; i < paramsSize; i++) {
-            params.put(result.paramName(i), result.paramValue(i).toString());
-        }
+      for (int i = 0; i < paramsSize; i++) {
+          params.put(result.paramName(i), result.paramValue(i).toString());
+      }
 
-        Set<Route.Definition> routeDefs = ImmutableSet.of(definition);
+      Set<Route.Definition> routeDefs = ImmutableSet.of(definition);
 
-        List<Route> routes = findRoutes(routeDefs, method, path, params, type, accept);
+      List<Route> routes = findRoutes(routeDefs, method, path, params, type, accept, matchMediaType);
 
-        routes.add(RouteImpl.fallback((req, rsp, chain) -> {
-            if (!rsp.status().isPresent()) {
-                // 406 or 415
-                Err ex = handle406or415(result, method, path, params, type, accept);
-                if (ex != null) {
-                    throw ex;
-                }
-                // 405
-                ex = handle405(routeDefs, method, path, params, type, accept);
-                if (ex != null) {
-                    throw ex;
-                }
-                // favicon.ico
-                if (path.equals("/favicon.ico")) {
-                    // default /favicon.ico handler:
-                    rsp.status(Status.NOT_FOUND).end();
-                } else {
-                    throw new Err(Status.NOT_FOUND, req.path(true));
-                }
-            }
-        }, method, path, "err", accept));
+      routes.add(RouteImpl.fallback((req, rsp, chain) -> {
+          if (!rsp.status().isPresent()) {
+              // 406 or 415
+              Err ex = handle406or415(result, method, path, params, type, accept);
+              if (ex != null) {
+                  throw ex;
+              }
+              // 405
+              ex = handle405(routeDefs, method, path, params, type, accept);
+              if (ex != null) {
+                  throw ex;
+              }
+              // favicon.ico
+              if (path.equals("/favicon.ico")) {
+                  // default /favicon.ico handler:
+                  rsp.status(Status.NOT_FOUND).end();
+              } else {
+                  throw new Err(Status.NOT_FOUND, req.path(true));
+              }
+          }
+      }, method, path, "err", accept));
 
-        return routes.toArray(new Route[routes.size()]);
+      return routes.toArray(new Route[routes.size()]);
     }
 
     private static List<Route> findRoutes(final Set<Route.Definition> routeDefs, final String method,
                                           final String path, final Map<Object, String> vars,
-                                          final MediaType type, final List<MediaType> accept) {
+                                          final MediaType type, final List<MediaType> accept,
+                                          final boolean matchMediaType) {
 
-        List<Route> routes = new LinkedList<>();
-        for (Route.Definition routeDef : routeDefs) {
-            Optional<Route> route = routeDef.simplyMatches(method, path, vars, type, accept);
-            route.ifPresent(routes::add);
-        }
-        return routes;
+      List<Route> routes = new LinkedList<>();
+      for (Route.Definition routeDef : routeDefs) {
+          Optional<Route> route = routeDef.simplyMatches(method, path, vars, type, accept, matchMediaType);
+          route.ifPresent(routes::add);
+      }
+      return routes;
     }
 
   private static Optional<WebSocket> findSockets(final Set<WebSocket.Definition> sockets,
@@ -694,8 +702,9 @@ public class HttpHandlerImpl implements HttpHandler {
     List<Route> routes = new LinkedList<>();
     Set<String> verbs = Sets.newHashSet(Route.METHODS);
     verbs.remove(verb);
+
     for (String alt : verbs) {
-      findRoutes(routeDefs, alt, uri, vars, MediaType.all, MediaType.ALL)
+      findRoutes(routeDefs, alt, uri, vars, MediaType.all, MediaType.ALL, false)
           .stream()
           // skip glob pattern
           .filter(r -> !r.pattern().contains("*"))
@@ -711,7 +720,7 @@ public class HttpHandlerImpl implements HttpHandler {
 
       Route.Definition routeDef = result.target();
 
-      Optional<Route> route = routeDef.simplyMatches(method, path, vars, MediaType.all, MediaType.ALL);
+      Optional<Route> route = routeDef.simplyMatches(method, path, vars, MediaType.all, MediaType.ALL, false);
       if (route.isPresent() && !route.get().pattern().contains("*")) {
         if (!routeDef.canProduce(accept)) {
           return new Err(Status.NOT_ACCEPTABLE, accept.stream()

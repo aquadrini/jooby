@@ -1646,7 +1646,12 @@ public interface Route {
                                    final String path,
                                    final Map<Object,String> vars,
                                    final MediaType contentType,
-                                   final List<MediaType> accept) {
+                                   final List<MediaType> accept,
+                                   final boolean matchMediaType) {
+
+      if (!matchMediaType) {
+        return Optional.of(asRoute(method, path, vars, produces, new RouteSourceImpl(declaringClass, line)));
+      }
 
       List<MediaType> result = MediaType.matcher(accept).filter(this.produces);
       if (result.size() > 0 && canConsume(contentType)) {
